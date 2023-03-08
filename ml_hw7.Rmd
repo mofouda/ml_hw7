@@ -1,0 +1,241 @@
+---
+title: "ml_hw7"
+author: "Mohammad"
+date: "2023-03-04"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(randomForest)
+library(caret)
+library(gbm)
+library(pROC)
+library(rpart.plot)
+library(rpart)
+
+knitr::opts_chunk$set(
+	echo = TRUE,
+	warning = FALSE,
+	fig.width = 8, 
+  fig.height = 6,
+  out.width = "90%")
+```
+
+
+## Goal:
+
+To predict 30-day readmission risk among patients currently hospitalized for acute myocardial infarction using a smaple dataset. 
+
+The dataset (mi.data.final) consists of  an ID variable, 14 features describing clinical tests and comorbidities, and an indicator for whether the individual was readmitted to the hospital within 30 days of discharge.
+
+The variables are as follows:
+
+* `ID`: identifier
+* `Age`: age at initial MI (years)
+* `Sex`: Reported by patient 0-Male, 1-Female, 2-Non-binary/Other
+* `sodium`: serum sodium (mmol/L)
+* `ALT`: liver enzymes (IU/L)
+* `WBC`: white blood cell count (billions/L)
+* `ESR`: erythrocyte sedimentation rate
+* `SBP`: systolic blood pressure at intake (mmHg)
+* `DBP`: diastolic blood pressure at intake (mmHg)
+* `Pulm.adema`: Pulmonary adema (1=Yes, 0=No)
+* `FC`: functional class of angina pectoris in the last year
+- `1`: there is no angina pectoris 
+- `2`: I FC 
+- `3`: II FC 
+- `4`: III FC 
+- `5`: IV FC 
+* `Arrythmia`: Presence of arrythmia (1=Yes, 0=No)
+* `Diab`: Presence of diabetes (1=Yes, 0=No)
+* `Obesity`: Presence of obesity (1=Yes, 0=No)
+* `Asthma`: Presence of asthma (1=Yes, 0=No)
+* `readmission`: Readmitted to hospital within 30 days (1=Yes, 0=No)
+
+## Preprocessing
+
+First we read-in the dataset, tidy the variable names, and convert variables to their appropriate class. Then we check the dataset for missingness and for any imbalance. No missing observations was found but the data is imbalanced and the outcome is rare.
+
+
+```{r preprocessing}
+set.seed(123)
+
+readmit <-
+    read_csv("data/mi.data.csv") %>% 
+    janitor::clean_names() %>% 
+    select(- id) %>% 
+    mutate(
+        sex = factor(sex),
+        pulm_adema = factor(pulm_adema),
+        fc = factor(fc),
+        arr = factor(arr),
+        diab = factor(diab),
+        obesity = factor(obesity),
+        asthma = factor(asthma),
+        readmission = factor(readmission)
+    )
+
+Amelia::missmap(readmit)
+
+str(readmit)
+summary(readmit[ , "readmission"])
+```
+
+For this assignment, you will implement the pipeline you sketched out with your group. As a reminder, your pipeline should include tasks for data preparation, any partitioning or resampling you deem necessary, any tuning of hyperparameters, and explicit evaluation metrics you will examine in order to choose your optimal algorithm. You can choose to examine different algorithms than elastic net and random forest, but you must compare at least two algorithms and one should be an ensemble algorithm.
+
+## Paritioning
+
+Next we split the data into training and testing datasets (70/30) split.
+
+```{r partitioning}
+train.index <- 
+    readmit$readmission %>% 
+    createDataPartition(p = 0.7, list = FALSE)
+
+train_df <- 
+    readmit[train.index, ]
+
+test_df <- 
+    readmit[-train.index, ]
+```
+
+## Comparing models
+
+In this step we use 4 different algorithms to train models and compare accuracies to evaluate model performances. To mitigate the data imbalance, we use `up` sampling to to increase the minority samples representation in the training data.
+
+### Logistic regression.
+
+This model results in an accuracy = 0.60. The most important variables in this model are unctional class of angina pectoris in the last year, diastolic blood pressure, Pulmonary adema, and presence of arrythmia.
+
+```{r glm}
+set.seed(123) 
+
+glm <-
+    train(readmission ~., data = train_df, method = "glm",
+          trControl = trainControl("cv", number = 10, sampling = "up"),  family = "binomial",
+          preProc = c("center", "scale"))
+
+#Model performance
+confusionMatrix(glm)
+varImp(glm)
+```
+
+### Elastic net
+
+First we try an eslatic net model using the defaults for the hyperparameters. This results in an accuracy = 0.61 and the most important variables are diastolic blood pressure, classes of angina pectoris of last year, and pulmonary edema which is not very different from the logistic regression model. 
+
+```{r elastic_net1}
+set.seed(123)
+
+enet1 <-
+    train(readmission ~., data = train_df, method = "glmnet", 
+          trControl = trainControl("cv", number = 10, sampling = "up"), 
+          preProc = c("center", "scale"), tuneLength = 10, metric="Accuracy")
+
+confusionMatrix(enet1)
+varImp(enet1)
+```
+
+
+In this step we try an elastic net model where we tune the hyperparameters using a grid. The model accuracy = 0.61. The overall variable importance is similar to that from the first elastic net model.  
+
+```{r elastic_net}
+set.seed(123)
+alpha <- seq(0.1, 1, length = 10)
+lambda <- 10^seq(-3, 3, length = 100)
+
+enet <-
+    train(readmission ~., data = train_df, method = "glmnet", 
+          trControl = trainControl("cv", number = 10, sampling = "up"), 
+          preProc = c("center", "scale"),  tuneGrid = expand.grid(alpha = alpha, lambda = lambda), 
+          metric="Accuracy")
+
+enet$bestTune
+enet$results
+
+confusionMatrix(enet)
+enet$finalModel
+
+varImp(enet)
+plot(varImp(enet2))
+```
+
+
+### Random forest
+
+Next we use random forest to train the model and compare performance. First we try a model with three different values for mtry, 10 forld cross validation and up sampling. The resulting accuracy = 0.57 and the most important variables include white blood cell count, age, serum sodium level, erythrocyte sedimentation rate, and liver enzymes.
+
+```{r RF}
+set.seed(123)
+
+mtry <- c(ncol(train_df)-1, sqrt(ncol(train_df)-1), 0.5*ncol(train_df)-1)
+mtrygrid <- expand.grid(.mtry = round(mtry))
+
+rf <- 
+    train(readmission ~., data = train_df, method = "rf", metric = "Accuracy", 
+          tuneGrid = mtrygrid, trControl = trainControl("cv", number = 10, sampling = "down"),
+          ntree = 100)
+
+confusionMatrix(rf)
+
+varImp(rf)
+plot(varImp(rf))
+
+rf$finalModel
+varImpPlot(rf$finalModel)
+```
+
+### Gradient boosting 
+
+In this step we use gardient boosting to train the model. First we train a model holding all hyperparameters constant and no cross validation using using bootstrapping default. The resulting accuracy = 0.56 and the most important variables are white blood cell count, diastolic blood pressure, and serum sodium levels
+
+```{r gbm1}
+set.seed(123)
+
+gbm1 <- 
+    train(readmission ~., data = train_df, method = "gbm", distribution = "bernoulli", verbose = F,
+          tuneGrid = data.frame(.n.trees = 1000, .shrinkage = 0.001, .interaction.depth = 1, .n.minobsinnode = 10), 
+          trControl = trainControl(sampling="up"))
+
+confusionMatrix(gbm1)
+varImp(gbm1)
+```
+
+
+Next we use gradient boosting to train a model with tuned hyperparameters. The resulting accuracy = 0.90 though the model may not be the best for classification due very low sensitivity and high specificity.
+
+```{r gbm2}
+
+set.seed(123)
+
+gridgbm <- expand.grid(n.trees=(0:10)*100, shrinkage=c(0.01, 0.001), interaction.depth=c(1,3), n.minobsinnode=10)
+
+gbm2 <- 
+    train(readmission ~., data=train_df, method="gbm", distribution="bernoulli", verbose=F, tuneGrid=gridgbm, 
+          trControl=trainControl(number = 5, sampling="up"))
+
+confusionMatrix(gbm2)
+```
+
+### Model perforance 
+
+In comparing different model performance trained using different algorithms, models fit using gradient boosting with tuned hyperparameters shows the highest accuracy (0.90). However, the model may not be the best for classification due very low sensitivity and high specificity. By contrast, the model trained using logistic regression (accuracy = 0.61) and elastic net (accuracy = 0.56) show lower accuracy but better sensitivity and specificity which are important metrics in classification. Looking at the variable importance from both these models such as diastolic blood pressure, classes of angina pectoris of last year, and pulmonary edema could be inofrmative in further developing other models for predictions that can perform better. 
+
+### Predections
+
+Since it had better sensitivity and specificty and slightly higher accuracy compared to the model from elastic net, we use the logistic regression model to make predictions on the testing data. The resulting accuracy = 0.58 which remains low and would need further training to improve accuracy but there's balance in sensitivity (.60) and specificty (0.58) which means the model is learning and better at classification compared to the gadient boosting model.
+
+
+```{r predictions}
+set.seed(123)
+
+#Make predictions in test set
+preds <- predict(glm, test_df)
+
+#Get evaluation metrics from test set
+confusionMatrix(preds, test_df$readmission, positive = "1")
+varImp(glm)
+plot(varImp(glm))
+```
+
